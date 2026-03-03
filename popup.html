@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatGPT Exporter</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      color: #1a1a1a;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    /* ── Header ─────────────────────────────────────── */
+    .header {
+      background: #10a37f;
+      color: white;
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transition: background 0.6s ease;
+    }
+    .header.is-done {
+      background: linear-gradient(135deg, #0d8c6c 0%, #10a37f 60%, #1ec99a 100%);
+      background-size: 200% 200%;
+      animation: headerShine 3s ease infinite;
+    }
+    @keyframes headerShine {
+      0%, 100% { background-position: 0% 50%; }
+      50%       { background-position: 100% 50%; }
+    }
+    .header-icon { flex-shrink: 0; transition: transform 0.4s ease; }
+    .header.is-done .header-icon { transform: scale(1.15); }
+    .header h1 { font-size: 15px; font-weight: 600; }
+    .header p  { font-size: 11px; opacity: 0.85; margin-top: 2px; }
+
+    /* ── Body ───────────────────────────────────────── */
+    .body { padding: 14px 16px 12px; }
+
+    #projectCount {
+      background: #f0faf6;
+      border: 1px solid #c3e8da;
+      border-radius: 6px;
+      padding: 7px 11px;
+      font-size: 13px;
+      color: #0d7a5f;
+      margin-bottom: 12px;
+      min-height: 30px;
+    }
+
+    button {
+      width: 100%;
+      padding: 11px;
+      background: #10a37f;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      transition: background 0.15s, transform 0.1s;
+    }
+    button:hover:not(:disabled) { background: #0d8c6c; transform: translateY(-1px); }
+    button:active:not(:disabled){ transform: translateY(0); }
+    button:disabled { background: #b8b8b8; cursor: not-allowed; transform: none; }
+
+    /* ── Progress bar ───────────────────────────────── */
+    .progress-wrap {
+      margin-top: 10px;
+      background: #e8e8e8;
+      border-radius: 6px;
+      height: 6px;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-wrap.visible { display: block; }
+    .progress-bar {
+      height: 100%;
+      background: #10a37f;
+      border-radius: 6px;
+      width: 0%;
+      transition: width 0.5s ease;
+    }
+    .progress-bar.is-done {
+      background: linear-gradient(90deg, #10a37f, #1ed9a4, #10a37f);
+      background-size: 200% 100%;
+      animation: barShimmer 1.2s linear infinite;
+    }
+    @keyframes barShimmer {
+      0%   { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+
+    /* ── ETA label ──────────────────────────────────── */
+    #etaDisplay {
+      font-size: 12px;
+      color: #999;
+      margin-top: 5px;
+      min-height: 17px;
+      text-align: right;
+      transition: opacity 0.3s;
+    }
+
+    /* ── Status box ─────────────────────────────────── */
+    #statusBox {
+      margin-top: 10px;
+      padding: 9px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      display: none;
+    }
+    #statusBox.info    { background: #f5f5f5; color: #555; display: block; }
+    #statusBox.error   { background: #fff0f0; color: #c0392b; display: block; }
+    #statusBox.success {
+      display: block;
+      background: #e8f9f3;
+      border: 1.5px solid #10a37f;
+      color: #0a6147;
+      animation: successPop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    @keyframes successPop {
+      0%   { transform: scale(0.85); opacity: 0; }
+      100% { transform: scale(1);    opacity: 1; }
+    }
+
+    /* ── Done overlay (big checkmark) ──────────────── */
+    #doneOverlay {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 0 4px;
+      animation: fadeIn 0.3s ease;
+    }
+    #doneOverlay.visible { display: flex; }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .done-check {
+      font-size: 42px;
+      line-height: 1;
+      animation: checkBounce 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) 0.1s both;
+    }
+    @keyframes checkBounce {
+      0%   { transform: scale(0);   opacity: 0; }
+      60%  { transform: scale(1.2); opacity: 1; }
+      100% { transform: scale(1);   opacity: 1; }
+    }
+    .done-title {
+      margin-top: 6px;
+      font-size: 15px;
+      font-weight: 700;
+      color: #0a6147;
+    }
+    .done-sub {
+      margin-top: 3px;
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+      white-space: pre-wrap;
+    }
+
+    /* ── Footer ─────────────────────────────────────── */
+    .footer {
+      border-top: 1px solid #eee;
+      padding: 9px 16px;
+      font-size: 11px;
+      color: #aaa;
+      text-align: center;
+    }
+    .footer a { color: #10a37f; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+
+  <div class="header" id="header">
+    <svg class="header-icon" width="24" height="24" viewBox="0 0 24 24" fill="none">
+      <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"
+            stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div>
+      <h1>ChatGPT Exporter</h1>
+      <p>Export conversations with project structure</p>
+    </div>
+  </div>
+
+  <div class="body">
+
+    <div id="projectCount">🔍 Detecting projects...</div>
+
+    <button id="exportBtn">📥 Export to ZIP</button>
+
+    <!-- Progress bar + ETA -->
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div id="etaDisplay"></div>
+
+    <!-- Status / error text -->
+    <div id="statusBox"></div>
+
+    <!-- Done overlay (shown instead of statusBox when complete) -->
+    <div id="doneOverlay">
+      <div class="done-check">✅</div>
+      <div class="done-title">Export Complete!</div>
+      <div class="done-sub" id="doneSub"></div>
+    </div>
+
+  </div>
+
+  <div class="footer">
+    <a href="https://github.com/vincze-tamas/chatgpt-exporter" target="_blank">GitHub</a>
+    &nbsp;·&nbsp; Downloads a ready-to-use <strong>.zip</strong> — no Python needed
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
