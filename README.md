@@ -46,16 +46,6 @@
 
 The extension icon appears in your toolbar. If it's hidden, click the puzzle-piece icon and pin *ChatGPT Conversation Exporter*.
 
-### Option B — Generate a nicer icon (optional)
-
-If the icon appears as a blank square, run once:
-
-```bash
-python generate_icons.py
-```
-
-Requires Python 3.8+. After running, reload the extension in `chrome://extensions`.
-
 ---
 
 ## Usage
@@ -165,7 +155,6 @@ The full source code is auditable in this repository.
 
 - Chrome 109+ or any Chromium-based browser (Edge, Brave, Arc, …)
 - A ChatGPT account (Free or Plus)
-- Python 3.8+ only if you want to regenerate the icon (`generate_icons.py`)
 
 ---
 
@@ -178,7 +167,6 @@ The full source code is auditable in this repository.
 | Export stops mid-way | Keep the `chatgpt.com` tab open and visible. The extension keeps running in the background. |
 | ZIP is empty or very small | A temporary API error occurred — try again. |
 | Conversations appear in the wrong project | Make sure you're on the latest version; reload the extension if needed. |
-| Icon is a blank square | Run `python generate_icons.py` once, then reload the extension. |
 
 **Still stuck?** [Open an issue](https://github.com/vincze-tamas/chatgpt-exporter/issues) and include:
 - Your Chrome version (`chrome://version`)
