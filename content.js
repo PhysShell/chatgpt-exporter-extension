@@ -21,18 +21,6 @@
   // ── Utilities ──────────────────────────────────────────────
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  function safeFilename(name, maxLen = 80) {
-    return (name || 'Untitled')
-      .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
-      .replace(/^[\s.]+|[\s.]+$/g, '')
-      .slice(0, maxLen) || 'Untitled';
-  }
-
-  function formatDate(unixTs) {
-    if (!unixTs) return '0000-00-00';
-    return new Date(unixTs * 1000).toISOString().slice(0, 10);
-  }
-
   // ── Auth ───────────────────────────────────────────────────
   async function getAccessToken() {
     try {
@@ -114,7 +102,7 @@
   }
 
   // ══════════════════════════════════════════════════════════
-  // MARKDOWN CONVERSION
+  // CONVERSATION → FLAT JSON
   // ══════════════════════════════════════════════════════════
   function extractText(content) {
     const ct = content.content_type || 'text';
@@ -147,7 +135,7 @@
         const content = msg.content || {};
         if ((role === 'user' || role === 'assistant') && content) {
           const text = extractText(content).trim();
-          if (text) path.push({ role, text, time: msg.create_time || 0 });
+          if (text) path.push({ role, text });
         }
       }
       nodeId = node.parent;
@@ -156,101 +144,19 @@
     return path;
   }
 
-  function conversationToMarkdown(convData) {
-    const title      = (convData.title || 'Untitled').replace(/\n+/g, ' ');
-    const createTime = convData.create_time || 0;
-    const updateTime = convData.update_time || 0;
-    const convId     = convData.id || '';
-    const lines      = [`# ${title}`, ''];
-    if (createTime) lines.push(`**Created:** ${new Date(createTime * 1000).toLocaleString()}`);
-    if (updateTime && updateTime !== createTime)
-      lines.push(`**Updated:** ${new Date(updateTime * 1000).toLocaleString()}`);
-    if (convId) lines.push(`**ID:** \`${convId}\``);
-    lines.push('', '---', '');
-    const messages = extractMessages(convData);
-    if (!messages.length) {
-      lines.push('*(Empty or unreadable conversation)*');
-    } else {
-      for (const msg of messages) {
-        lines.push(msg.role === 'user' ? '### You' : '### ChatGPT');
-        lines.push('', msg.text, '', '---', '');
-      }
-    }
-    return lines.join('\n');
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // MINIMAL ZIP BUILDER (no external deps, store method)
-  // ══════════════════════════════════════════════════════════
-  const CRC32_TABLE = (() => {
-    const t = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) {
-      let c = i;
-      for (let j = 0; j < 8; j++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
-      t[i] = c;
-    }
-    return t;
-  })();
-
-  function crc32(data) {
-    let crc = 0xFFFFFFFF;
-    for (let i = 0; i < data.length; i++)
-      crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ data[i]) & 0xFF];
-    return (crc ^ 0xFFFFFFFF) >>> 0;
-  }
-
-  function u16(v) { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v & 0xFFFF, true); return b; }
-  function u32(v) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v >>> 0,   true); return b; }
-
-  function concat(arrays) {
-    const total  = arrays.reduce((s, a) => s + a.length, 0);
-    const result = new Uint8Array(total);
-    let   pos    = 0;
-    for (const a of arrays) { result.set(a, pos); pos += a.length; }
-    return result;
-  }
-
-  // files: Array of { path: string, data: Uint8Array }
-  function buildZip(files) {
-    const enc         = new TextEncoder();
-    const localChunks = [];
-    const centralDir  = [];
-    let   offset      = 0;
-
-    for (const { path, data } of files) {
-      const nameBytes = enc.encode(path);
-      const crc       = crc32(data);
-      const size      = data.length;
-
-      const local = concat([
-        new Uint8Array([0x50, 0x4B, 0x03, 0x04]),
-        u16(20), u16(0x0800), u16(0), u16(0), u16(0),
-        u32(crc), u32(size), u32(size),
-        u16(nameBytes.length), u16(0),
-        nameBytes, data,
-      ]);
-      const central = concat([
-        new Uint8Array([0x50, 0x4B, 0x01, 0x02]),
-        u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0),
-        u32(crc), u32(size), u32(size),
-        u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0),
-        u32(offset), nameBytes,
-      ]);
-
-      localChunks.push(local);
-      centralDir.push(central);
-      offset += local.length;
-    }
-
-    const cdSize = centralDir.reduce((s, c) => s + c.length, 0);
-    const eocd   = concat([
-      new Uint8Array([0x50, 0x4B, 0x05, 0x06]),
-      u16(0), u16(0),
-      u16(files.length), u16(files.length),
-      u32(cdSize), u32(offset), u16(0),
-    ]);
-
-    return concat([...localChunks, ...centralDir, eocd]);
+  function conversationToFlat(convData, projectName) {
+    return {
+      project:         projectName || null,
+      conversation_id: convData.id || '',
+      title:           (convData.title || 'Untitled').replace(/\n+/g, ' '),
+      created_at:      convData.create_time
+                         ? new Date(convData.create_time * 1000).toISOString()
+                         : null,
+      messages: extractMessages(convData).map(m => ({
+        role:    m.role,
+        content: m.text,
+      })),
+    };
   }
 
   // ── Project detection ──────────────────────────────────────
@@ -406,15 +312,13 @@
     const total = allMeta.length;
     if (!total) { fail('No conversations found.'); return; }
 
-    // 5. Fetch details + convert to Markdown
-    const zipFiles      = [];
-    const usedNames     = {};
+    // 5. Fetch details + flatten to JSON
+    const conversations = [];
     const detailStart   = Date.now();
-    const enc           = new TextEncoder();
 
     for (let i = 0; i < allMeta.length; i++) {
-      const conv    = allMeta[i];
-      const pct     = 35 + Math.round((i + 1) / total * 62);
+      const conv = allMeta[i];
+      const pct  = 35 + Math.round((i + 1) / total * 62);
 
       // ETA: elapsed / done * remaining
       let eta = null;
@@ -428,40 +332,26 @@
       const data = await apiFetch(`${BASE}/conversation/${conv.id}`);
       if (!data) { await sleep(300); continue; }
 
-      const projName   = conv._project_name;
-      const folderPath = projName
-        ? `chatgpt_export/Projects/${safeFilename(projName)}/`
-        : 'chatgpt_export/Conversations/';
-
-      const date     = formatDate(data.create_time || conv.create_time);
-      const baseFile = `${date}_${safeFilename(data.title || conv.title || 'Untitled')}`;
-      usedNames[folderPath] = usedNames[folderPath] || {};
-      let filename = baseFile + '.md';
-      let counter  = 1;
-      while (usedNames[folderPath][filename]) filename = `${baseFile}_${counter++}.md`;
-      usedNames[folderPath][filename] = true;
-
-      zipFiles.push({ path: folderPath + filename, data: enc.encode(conversationToMarkdown(data)) });
+      conversations.push(conversationToFlat(data, conv._project_name || null));
       await sleep(300);
     }
 
-    // 6. Build ZIP & trigger download
-    progress('Creating ZIP…', 98);
-    const today   = new Date().toISOString().slice(0, 10);
-    const zipData = buildZip(zipFiles);
-    const blob    = new Blob([zipData], { type: 'application/zip' });
-    const url     = URL.createObjectURL(blob);
-    const a       = document.createElement('a');
-    a.href        = url;
-    a.download    = `chatgpt_export_${today}.zip`;
+    // 6. Build JSON & trigger download
+    progress('Creating JSON…', 98);
+    const today = new Date().toISOString().slice(0, 10);
+    const blob  = new Blob([JSON.stringify(conversations, null, 2)], { type: 'application/json' });
+    const url   = URL.createObjectURL(blob);
+    const a     = document.createElement('a');
+    a.href      = url;
+    a.download  = `chatgpt_export_${today}.json`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 5000);
 
     done(
-      `Done! ${zipFiles.length} conversations exported.\n` +
-      `File: chatgpt_export_${today}.zip`
+      `Done! ${conversations.length} conversations exported.\n` +
+      `File: chatgpt_export_${today}.json`
     );
   }
 

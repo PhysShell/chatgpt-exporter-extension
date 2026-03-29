@@ -39,6 +39,18 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.1.0] — 2026-03-29
+
+### Changed
+
+- Export format changed from ZIP (multiple `.md` files) to a single flat `.json` file
+- Each conversation is now a JSON object with `project`, `conversation_id`, `title`, `created_at`, and `messages` fields
+- Messages array contains only `role` and `content` fields
+- Conversations without a project have `"project": null`
+- Removed ZIP builder, CRC32, Markdown converter — codebase significantly simplified
+
+---
+
 ## [1.0.1] — 2026-03-29
 
 ### Fixed
