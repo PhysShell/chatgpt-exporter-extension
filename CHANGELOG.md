@@ -39,12 +39,8 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-<!-- next release placeholder
+## [1.0.1] — 2026-03-29
 
-## [1.1.0] — TBD
-
-### Added
 ### Fixed
-### Changed
 
--->
+- ZIP builder now sets the UTF-8 flag (`0x0800`) in the General Purpose Bit Flag field of both the local file header and central directory entries — fixes garbled non-ASCII characters (e.g. Hungarian á, é, ő, ű) in exported project folder and file names on Windows and other ZIP tools that default to the system codepage
