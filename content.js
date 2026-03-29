@@ -224,14 +224,14 @@
 
       const local = concat([
         new Uint8Array([0x50, 0x4B, 0x03, 0x04]),
-        u16(20), u16(0), u16(0), u16(0), u16(0),
+        u16(20), u16(0x0800), u16(0), u16(0), u16(0),
         u32(crc), u32(size), u32(size),
         u16(nameBytes.length), u16(0),
         nameBytes, data,
       ]);
       const central = concat([
         new Uint8Array([0x50, 0x4B, 0x01, 0x02]),
-        u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+        u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0),
         u32(crc), u32(size), u32(size),
         u16(nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0),
         u32(offset), nameBytes,
