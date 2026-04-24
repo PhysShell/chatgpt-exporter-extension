@@ -267,10 +267,11 @@
         const items = Array.isArray(data) ? data : (data.items || data.conversations || []);
         if (!items.length) break;
         projectConvMeta[gizmoId].push(...items);
+        console.log('[ChatGPT Exporter] project fetched:', projects[gizmoId], projectConvMeta[gizmoId].length, 'next cursor:', data.cursor || data.next_cursor);
         const next = data.cursor || data.next_cursor || null;
-        if (!next || !data.has_more) break;
+        if (!next || next === cursor) break;
         cursor = next;
-        await sleep(300);
+        await sleep(1300);
       }
       const pct = 10 + Math.round((pi + 1) / projectIds.length * 20);
       progress(
@@ -288,8 +289,9 @@
       if (!data) break;
       const items = data.items || [];
       regularConvMeta.push(...items);
+      console.log('[ChatGPT Exporter] regular fetched:', regularConvMeta.length, 'next cursor:', data.cursor || data.next_cursor);
       const next = data.cursor || data.next_cursor || null;
-      if (!next || !data.has_more || !items.length) break;
+      if (!next || next === cursor || !items.length) break;
       cursor = next;
       await sleep(300);
     }
