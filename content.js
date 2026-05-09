@@ -8,6 +8,31 @@
 
 (function () {
   const BASE = 'https://chatgpt.com/backend-api';
+  const RateLimit = window.ChatGPTExporterRateLimit || {};
+  const RL_CONFIG = RateLimit.DEFAULTS || {
+    listDelayMs: 1200,
+    detailDelayMs: 4000,
+    otherDelayMs: 1200,
+    minListDelayMs: 1000,
+    minDetailDelayMs: 3500,
+    minOtherDelayMs: 1000,
+    maxListDelayMs: 30000,
+    maxDetailDelayMs: 120000,
+    maxOtherDelayMs: 30000,
+    listInitialBackoffMs: 10000,
+    detailInitialBackoffMs: 60000,
+    otherInitialBackoffMs: 10000,
+    networkInitialBackoffMs: 2500,
+    maxBackoffMs: 15 * 60 * 1000,
+    maxRetries: 4,
+    cooldownFactor: 1.5,
+    recoveryStepMs: 250,
+    recoveryThreshold: 40,
+    detailStartCooldownMs: 30000,
+    detailBatchSize: 75,
+    detailBatchCooldownMs: 45000,
+    retrySweepCooldownMs: 10 * 60 * 1000,
+  };
 
   // ── Persistent state (survives popup close/reopen) ─────────
   let isExporting  = false;
@@ -21,6 +46,85 @@
   // ── Utilities ──────────────────────────────────────────────
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+  // ── Rate limiter state (adaptive, endpoint-aware) ──────────
+  const RL = {
+    listDelayMs:       RL_CONFIG.listDelayMs,
+    detailDelayMs:     RL_CONFIG.detailDelayMs,
+    otherDelayMs:      RL_CONFIG.otherDelayMs,
+    maxRetries:        RL_CONFIG.maxRetries,
+    globalPauseUntil:  0,
+    successStreak:     { list: 0, detail: 0, other: 0 },
+  };
+
+  function delayKey(kind) {
+    return kind === 'detail' ? 'detailDelayMs' : kind === 'list' ? 'listDelayMs' : 'otherDelayMs';
+  }
+
+  function minDelayFor(kind) {
+    return kind === 'detail' ? RL_CONFIG.minDetailDelayMs
+      : kind === 'list' ? RL_CONFIG.minListDelayMs
+        : RL_CONFIG.minOtherDelayMs;
+  }
+
+  function maxDelayFor(kind) {
+    return kind === 'detail' ? RL_CONFIG.maxDetailDelayMs
+      : kind === 'list' ? RL_CONFIG.maxListDelayMs
+        : RL_CONFIG.maxOtherDelayMs;
+  }
+
+  function delayFor(kind) {
+    return RL[delayKey(kind)];
+  }
+
+  function setDelayFor(kind, value) {
+    RL[delayKey(kind)] = Math.max(minDelayFor(kind), Math.min(maxDelayFor(kind), Math.ceil(value)));
+  }
+
+  function requestKindFromUrl(url) {
+    if (/\/conversation\/[^/?#]+/.test(url)) return 'detail';
+    if (/\/conversations(?:[?#]|$)/.test(url) || /\/gizmos\/[^/]+\/conversations(?:[?#]|$)/.test(url)) return 'list';
+    return 'other';
+  }
+
+  function formatDuration(ms) {
+    if (RateLimit.formatDuration) return RateLimit.formatDuration(ms);
+    const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = String(totalSeconds % 60).padStart(2, '0');
+    return `${minutes}:${seconds}`;
+  }
+
+  function computeBackoffMs(args) {
+    if (RateLimit.computeBackoffMs) {
+      return RateLimit.computeBackoffMs({ ...args, config: RL_CONFIG });
+    }
+    const initial = args.kind === 'detail' ? RL_CONFIG.detailInitialBackoffMs : RL_CONFIG.listInitialBackoffMs;
+    return Math.min(RL_CONFIG.maxBackoffMs, initial * (2 ** Math.max(0, args.attempt || 0)));
+  }
+
+  function onRateLimited(kind) {
+    RL.successStreak[kind] = 0;
+    setDelayFor(kind, delayFor(kind) * RL_CONFIG.cooldownFactor);
+  }
+
+  function onSuccess(kind) {
+    RL.successStreak[kind]++;
+    if (RL.successStreak[kind] >= RL_CONFIG.recoveryThreshold && delayFor(kind) > minDelayFor(kind)) {
+      setDelayFor(kind, delayFor(kind) - RL_CONFIG.recoveryStepMs);
+      RL.successStreak[kind] = 0;
+    }
+  }
+
+  async function waitForGlobalPause() {
+    const wait = RL.globalPauseUntil - Date.now();
+    if (wait > 0) await sleep(wait);
+  }
+
+  function armGlobalPause(waitMs) {
+    RL.globalPauseUntil = Math.max(RL.globalPauseUntil, Date.now() + Math.max(0, waitMs));
+  }
+
   // ── Auth ───────────────────────────────────────────────────
   async function getAccessToken() {
     try {
@@ -30,19 +134,104 @@
     } catch { return null; }
   }
 
+  // Sentinel so callers distinguish "gave up / rate-limited" from "404 / truly missing".
+  const RL_EXHAUSTED = Symbol('rate_limit_exhausted');
+  const AUTH_EXHAUSTED = Symbol('auth_exhausted');
+
+  function makeAuthHeaders(accessToken) {
+    return accessToken
+      ? { Authorization: 'Bearer ' + accessToken, Accept: 'application/json' }
+      : { Accept: 'application/json' };
+  }
+
   function makeApiFetch(token) {
-    return async function apiFetch(url) {
-      try {
-        const headers = token ? { Authorization: 'Bearer ' + token } : {};
-        const r = await fetch(url, { credentials: 'include', headers });
-        if (!r.ok) { console.warn('[ChatGPT Exporter] HTTP', r.status, url); return null; }
+    let accessToken = token || null;
+
+    return async function apiFetch(url, { retries = RL.maxRetries, kind = requestKindFromUrl(url) } = {}) {
+      let attempt = 0;
+      let authRefreshes = 0;
+      while (true) {
+        await waitForGlobalPause();
+        let r;
+        try {
+          r = await fetch(url, { credentials: 'include', headers: makeAuthHeaders(accessToken) });
+        } catch (e) {
+          if (attempt >= retries) {
+            console.warn('[ChatGPT Exporter] network error, giving up:', e.message, url);
+            return null;
+          }
+          const wait = computeBackoffMs({ status: 'network', attempt, kind });
+          console.warn(`[ChatGPT Exporter] network error, retry ${attempt + 1}/${retries} in ${formatDuration(wait)}:`, e.message);
+          await sleep(wait);
+          attempt++;
+          continue;
+        }
+
+        if (r.status === 401) {
+          console.warn('[ChatGPT Exporter] HTTP 401, refreshing session token:', url);
+          progress('ChatGPT session token expired. Refreshing session...', currentPct, null);
+
+          if (authRefreshes >= 2) {
+            console.warn('[ChatGPT Exporter] authentication refresh failed, giving up:', url);
+            return AUTH_EXHAUSTED;
+          }
+
+          authRefreshes++;
+          const refreshedToken = await getAccessToken();
+          if (refreshedToken && refreshedToken !== accessToken) {
+            accessToken = refreshedToken;
+            await sleep(1000);
+            continue;
+          }
+
+          if (accessToken) {
+            // Some endpoints accept cookie auth; retry once without a stale Bearer.
+            accessToken = null;
+            await sleep(1000);
+            continue;
+          }
+
+          return AUTH_EXHAUSTED;
+        }
+
+        if (r.status === 429 || r.status === 502 || r.status === 503 || r.status === 504) {
+          onRateLimited(kind);
+          const retryAfterHeader = r.headers.get('Retry-After');
+          const wait = computeBackoffMs({ status: r.status, attempt, kind, retryAfterHeader });
+          armGlobalPause(wait);
+          if (wait >= 15000) {
+            progress(
+              `ChatGPT returned HTTP ${r.status}. Cooling down ${formatDuration(wait)} before retrying...`,
+              currentPct,
+              null
+            );
+          }
+          if (attempt >= retries) {
+            console.warn(`[ChatGPT Exporter] exhausted retries on HTTP ${r.status}, cooled down ${formatDuration(wait)}:`, url);
+            await sleep(wait);
+            return RL_EXHAUSTED;
+          }
+          console.warn(
+            `[ChatGPT Exporter] HTTP ${r.status}, cooldown ${formatDuration(wait)} ` +
+            `(attempt ${attempt + 1}/${retries}, ${kind} gap ${delayFor(kind)}ms)` +
+            (retryAfterHeader ? `, Retry-After: ${retryAfterHeader}` : '')
+          );
+          await sleep(wait);
+          attempt++;
+          continue;
+        }
+
+        if (!r.ok) {
+          console.warn('[ChatGPT Exporter] HTTP', r.status, url);
+          return null;
+        }
+        onSuccess(kind);
         return r.json().catch(() => null);
-      } catch (e) {
-        console.warn('[ChatGPT Exporter] fetch error:', e.message);
-        return null;
       }
     };
   }
+
+  function gapSleep(kind = 'other') { return sleep(delayFor(kind)); }
 
   // ── Progress (safe even when popup is closed) ──────────────
   function progress(text, pct, eta = null) {
@@ -77,6 +266,18 @@
       catch {}
       exportPort = null;
     }
+  }
+
+  function downloadJson(data, filename) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 
   // ── Befejezési hangjelzés (Web Audio API, engedély nélkül) ─
@@ -261,9 +462,14 @@
       let cursor = '0';
       while (true) {
         const data = await apiFetch(
-          `${BASE}/gizmos/${gizmoId}/conversations?cursor=${encodeURIComponent(cursor)}`
+          `${BASE}/gizmos/${gizmoId}/conversations?cursor=${encodeURIComponent(cursor)}`,
+          { kind: 'list' }
         );
-        if (!data) break;
+        if (data === AUTH_EXHAUSTED) {
+          fail('ChatGPT session expired. Refresh/reopen chatgpt.com, sign in again if needed, then restart export.');
+          return;
+        }
+        if (!data || data === RL_EXHAUSTED) break;
         const items = Array.isArray(data) ? data : (data.items || data.conversations || []);
         if (!items.length) break;
         projectConvMeta[gizmoId].push(...items);
@@ -271,7 +477,7 @@
         const next = data.cursor || data.next_cursor || null;
         if (!next || next === cursor) break;
         cursor = next;
-        await sleep(1300);
+        await gapSleep('list');
       }
       const pct = 10 + Math.round((pi + 1) / projectIds.length * 20);
       progress(
@@ -283,17 +489,35 @@
     // 3. Regular conversations
     progress('Fetching regular conversations…', 32);
     const regularConvMeta = [];
-    let cursor = '0';
+    const pageSize = 50;
     while (true) {
-      const data = await apiFetch(`${BASE}/conversations?cursor=${encodeURIComponent(cursor)}`);
-      if (!data) break;
+      const url = `${BASE}/conversations?offset=${regularConvMeta.length}&limit=${pageSize}`;
+      const data = await apiFetch(url, { kind: 'list' });
+
+      if (data === AUTH_EXHAUSTED) {
+        fail('ChatGPT session expired. Refresh/reopen chatgpt.com, sign in again if needed, then restart export.');
+        return;
+      }
+      if (!data || data === RL_EXHAUSTED) break;
+
       const items = data.items || [];
+
+      console.log(
+        '[ChatGPT Exporter] regular fetched batch:',
+        items.length,
+        'total:',
+        regularConvMeta.length + items.length,
+        'url:',
+        url
+      );
+
+      if (!items.length) break;
+
       regularConvMeta.push(...items);
-      console.log('[ChatGPT Exporter] regular fetched:', regularConvMeta.length, 'next cursor:', data.cursor || data.next_cursor);
-      const next = data.cursor || data.next_cursor || null;
-      if (!next || next === cursor || !items.length) break;
-      cursor = next;
-      await sleep(300);
+
+      if (items.length < pageSize) break;
+
+      await gapSleep('list');
     }
 
     // 4. Deduplicate
@@ -314,46 +538,114 @@
     const total = allMeta.length;
     if (!total) { fail('No conversations found.'); return; }
 
+    if (total > 200) {
+      progress(
+        `Cooling down ${formatDuration(RL_CONFIG.detailStartCooldownMs)} before full conversation downloads...`,
+        34,
+        null
+      );
+      await sleep(RL_CONFIG.detailStartCooldownMs);
+    }
+
     // 5. Fetch details + flatten to JSON
     const conversations = [];
+    const deferred      = [];  // rate-limit-exhausted → sweep later
+    const missing       = [];  // genuine nulls (404 etc)
     const detailStart   = Date.now();
+    const today         = new Date().toISOString().slice(0, 10);
+
+    function failWithPartial(reason) {
+      if (conversations.length) {
+        const filename = `chatgpt_export_partial_${today}_${conversations.length}_of_${total}.json`;
+        downloadJson(conversations, filename);
+        fail(`${reason}\nSaved partial file: ${filename}\nExported so far: ${conversations.length}/${total}.`);
+        return;
+      }
+      fail(reason);
+    }
 
     for (let i = 0; i < allMeta.length; i++) {
       const conv = allMeta[i];
-      const pct  = 35 + Math.round((i + 1) / total * 62);
+      const pct  = 35 + Math.round((i + 1) / total * 60);
 
-      // ETA: elapsed / done * remaining
       let eta = null;
       if (i > 0) {
         const elapsed = (Date.now() - detailStart) / 1000;
         eta = Math.round(elapsed / i * (total - i));
       }
 
-      progress(`Downloading (${i + 1}/${total}): "${(conv.title || 'Untitled').slice(0, 40)}"`, pct, eta);
+      progress(
+        `Downloading (${i + 1}/${total}): "${(conv.title || 'Untitled').slice(0, 40)}" [gap ${delayFor('detail')}ms]`,
+        pct,
+        eta
+      );
 
-      const data = await apiFetch(`${BASE}/conversation/${conv.id}`);
-      if (!data) { await sleep(300); continue; }
+      const data = await apiFetch(`${BASE}/conversation/${conv.id}`, { kind: 'detail' });
+      if (data === AUTH_EXHAUSTED) {
+        failWithPartial('ChatGPT session expired. Refresh/reopen chatgpt.com, sign in again if needed, then restart export.');
+        return;
+      } else if (data === RL_EXHAUSTED) {
+        deferred.push(conv);
+      } else if (!data) {
+        missing.push(conv);
+      } else {
+        conversations.push(conversationToFlat(data, conv._project_name || null));
+      }
+      if ((i + 1) % RL_CONFIG.detailBatchSize === 0 && i + 1 < allMeta.length) {
+        progress(
+          `Batch pause ${formatDuration(RL_CONFIG.detailBatchCooldownMs)} after ${i + 1}/${total} conversations...`,
+          pct,
+          eta
+        );
+        await sleep(RL_CONFIG.detailBatchCooldownMs);
+      }
+      await gapSleep('detail');
+    }
 
-      conversations.push(conversationToFlat(data, conv._project_name || null));
-      await sleep(300);
+    // 5b. Retry sweep for rate-limited conversations with cooler pace.
+    if (deferred.length) {
+      const originalDetailDelay = RL.detailDelayMs;
+      setDelayFor('detail', Math.max(delayFor('detail') * 2, 15000));
+      console.log(`[ChatGPT Exporter] retry sweep: ${deferred.length} rate-limited convs, gap ${delayFor('detail')}ms`);
+      progress(
+        `Cooling down ${formatDuration(RL_CONFIG.retrySweepCooldownMs)} before retrying ${deferred.length} rate-limited conversations...`,
+        95,
+        null
+      );
+      await sleep(RL_CONFIG.retrySweepCooldownMs);
+      for (let i = 0; i < deferred.length; i++) {
+        const conv = deferred[i];
+        const pct  = 95 + Math.round((i + 1) / deferred.length * 2);
+        progress(`Retry (${i + 1}/${deferred.length}): "${(conv.title || 'Untitled').slice(0, 40)}"`, pct);
+        const data = await apiFetch(`${BASE}/conversation/${conv.id}`, { retries: RL.maxRetries + 1, kind: 'detail' });
+        if (data === AUTH_EXHAUSTED) {
+          failWithPartial('ChatGPT session expired. Refresh/reopen chatgpt.com, sign in again if needed, then restart export.');
+          return;
+        } else if (data && data !== RL_EXHAUSTED) {
+          conversations.push(conversationToFlat(data, conv._project_name || null));
+        } else {
+          missing.push(conv);
+        }
+        await gapSleep('detail');
+      }
+      RL.detailDelayMs = originalDetailDelay;
+    }
+
+    if (missing.length) {
+      console.warn(`[ChatGPT Exporter] ${missing.length} conversations could not be fetched:`,
+        missing.map(c => c.id));
     }
 
     // 6. Build JSON & trigger download
     progress('Creating JSON…', 98);
-    const today = new Date().toISOString().slice(0, 10);
-    const blob  = new Blob([JSON.stringify(conversations, null, 2)], { type: 'application/json' });
-    const url   = URL.createObjectURL(blob);
-    const a     = document.createElement('a');
-    a.href      = url;
-    a.download  = `chatgpt_export_${today}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    downloadJson(conversations, `chatgpt_export_${today}.json`);
 
+    const missSuffix = missing.length
+      ? `\n${missing.length} could not be fetched (see console).`
+      : '';
     done(
       `Done! ${conversations.length} conversations exported.\n` +
-      `File: chatgpt_export_${today}.json`
+      `File: chatgpt_export_${today}.json` + missSuffix
     );
   }
 
