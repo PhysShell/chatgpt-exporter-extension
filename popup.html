@@ -70,6 +70,72 @@
     button:active:not(:disabled){ transform: translateY(0); }
     button:disabled { background: #b8b8b8; cursor: not-allowed; transform: none; }
 
+    /* ── Resume bar ─────────────────────────────────── */
+    #resumeBar {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      background: #fff8e6;
+      border: 1px solid #f0c040;
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      color: #7a5800;
+      gap: 8px;
+    }
+    #resumeBar.visible { display: flex; }
+    #resumeBar .resume-text { flex: 1; line-height: 1.4; }
+    #resumeBar .resume-actions { display: flex; gap: 6px; flex-shrink: 0; }
+    .resume-btn {
+      width: auto;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 6px;
+    }
+    .fresh-btn {
+      width: auto;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 500;
+      border-radius: 6px;
+      background: #e8e8e8;
+      color: #444;
+    }
+    .fresh-btn:hover:not(:disabled) { background: #d8d8d8; transform: translateY(-1px); }
+
+    /* ── Incremental row ────────────────────────────── */
+    .incr-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .file-pick {
+      flex: 1;
+      padding: 8px 10px;
+      background: #f5f5f5;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: background 0.15s;
+      user-select: none;
+    }
+    .file-pick:hover { background: #ebebeb; }
+    .update-btn {
+      width: auto;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+
     /* ── Progress bar ───────────────────────────────── */
     .progress-wrap {
       margin-top: 10px;
@@ -198,7 +264,25 @@
 
     <div id="projectCount">🔍 Detecting projects...</div>
 
+    <!-- Crash-recovery resume bar (shown when a checkpoint exists) -->
+    <div id="resumeBar">
+      <span class="resume-text" id="resumeText"></span>
+      <div class="resume-actions">
+        <button class="resume-btn" id="resumeBtn">▶ Resume</button>
+        <button class="fresh-btn" id="freshBtn">✕ Discard</button>
+      </div>
+    </div>
+
     <button id="exportBtn">📥 Export to JSON</button>
+
+    <!-- Incremental update row -->
+    <div class="incr-row">
+      <label class="file-pick" id="prevFileLabel" title="Load a previous export JSON to skip unchanged conversations">
+        <span id="prevFileTxt">📂 Load previous export</span>
+        <input type="file" id="prevFile" accept=".json" style="display:none">
+      </label>
+      <button id="updateBtn" class="update-btn" disabled title="Fetch only new or updated conversations">↻ Update</button>
+    </div>
 
     <!-- Progress bar + ETA -->
     <div class="progress-wrap" id="progressWrap">
