@@ -42,9 +42,14 @@
   let currentEta   = null;   // seconds remaining (null = unknown)
   let lastResult   = null;   // { type: 'done'|'error', text }
   const projects   = {};     // { "g-p-hex32": "Project Name" }
+  let activeKnownConvs = null; // Map<id, updated_at_iso> set at export start for incremental mode
 
   // ── Utilities ──────────────────────────────────────────────
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function isoFromUnix(t) {
+    return (t != null) ? new Date(Math.floor(t) * 1000).toISOString() : null;
+  }
 
   // ── Rate limiter state (adaptive, endpoint-aware) ──────────
   const RL = {
@@ -350,9 +355,8 @@
       project:         projectName || null,
       conversation_id: convData.id || '',
       title:           (convData.title || 'Untitled').replace(/\n+/g, ' '),
-      created_at:      convData.create_time
-                         ? new Date(convData.create_time * 1000).toISOString()
-                         : null,
+      created_at:      isoFromUnix(convData.create_time),
+      updated_at:      isoFromUnix(convData.update_time),
       messages: extractMessages(convData).map(m => ({
         role:    m.role,
         content: m.text,
@@ -433,6 +437,7 @@
       }
       lastResult  = null;
       isExporting = true;
+      activeKnownConvs = msg.knownConvs ? new Map(Object.entries(msg.knownConvs)) : null;
       runExport().catch(e => fail('Unexpected error: ' + e.message));
     });
 
@@ -553,12 +558,16 @@
     const missing       = [];  // genuine nulls (404 etc)
     const detailStart   = Date.now();
     const today         = new Date().toISOString().slice(0, 10);
+    const isIncremental = !!(activeKnownConvs && activeKnownConvs.size > 0);
+    let   skippedCount  = 0;
 
     function failWithPartial(reason) {
       if (conversations.length) {
-        const filename = `chatgpt_export_partial_${today}_${conversations.length}_of_${total}.json`;
+        const tag      = isIncremental ? 'delta_partial' : 'partial';
+        const filename = `chatgpt_export_${tag}_${today}_${conversations.length}_of_${total}.json`;
         downloadJson(conversations, filename);
-        fail(`${reason}\nSaved partial file: ${filename}\nExported so far: ${conversations.length}/${total}.`);
+        const skippedNote = isIncremental ? `, ${skippedCount} unchanged` : '';
+        fail(`${reason}\nSaved partial file: ${filename}\nExported so far: ${conversations.length}/${total}${skippedNote}.`);
         return;
       }
       fail(reason);
@@ -567,6 +576,19 @@
     for (let i = 0; i < allMeta.length; i++) {
       const conv = allMeta[i];
       const pct  = 35 + Math.round((i + 1) / total * 60);
+
+      // Incremental: skip conversations that haven't changed since previous export
+      if (activeKnownConvs) {
+        const storedUpdatedAt  = activeKnownConvs.get(conv.id);
+        const currentUpdatedAt = isoFromUnix(conv.update_time);
+        if (storedUpdatedAt && currentUpdatedAt && storedUpdatedAt === currentUpdatedAt) {
+          skippedCount++;
+          if (skippedCount % 100 === 0 || i === allMeta.length - 1) {
+            progress(`Checking ${i + 1}/${total}: ${skippedCount} unchanged so far…`, pct);
+          }
+          continue; // no API call, no sleep
+        }
+      }
 
       let eta = null;
       if (i > 0) {
@@ -638,15 +660,33 @@
 
     // 6. Build JSON & trigger download
     progress('Creating JSON…', 98);
-    downloadJson(conversations, `chatgpt_export_${today}.json`);
 
     const missSuffix = missing.length
       ? `\n${missing.length} could not be fetched (see console).`
       : '';
-    done(
-      `Done! ${conversations.length} conversations exported.\n` +
-      `File: chatgpt_export_${today}.json` + missSuffix
-    );
+
+    if (isIncremental) {
+      const deltaFilename = `chatgpt_delta_${today}_${conversations.length}new.json`;
+      const doneText =
+        `Done! ${conversations.length} new/updated, ${skippedCount} unchanged.\n` +
+        `Delta file: ${deltaFilename}` + missSuffix;
+      if (exportPort) {
+        try {
+          exportPort.postMessage({ type: 'delta_done', delta: conversations, skipped: skippedCount });
+          done(doneText);
+          return;
+        } catch { exportPort = null; }
+      }
+      // Popup not connected — save delta directly so nothing is lost
+      downloadJson(conversations, deltaFilename);
+      done(doneText);
+    } else {
+      downloadJson(conversations, `chatgpt_export_${today}.json`);
+      done(
+        `Done! ${conversations.length} conversations exported.\n` +
+        `File: chatgpt_export_${today}.json` + missSuffix
+      );
+    }
   }
 
 })();

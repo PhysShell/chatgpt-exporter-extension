@@ -1,17 +1,23 @@
 'use strict';
 
-const exportBtn    = document.getElementById('exportBtn');
-const statusBox    = document.getElementById('statusBox');
-const projectCount = document.getElementById('projectCount');
-const progressWrap = document.getElementById('progressWrap');
-const progressBar  = document.getElementById('progressBar');
-const etaDisplay   = document.getElementById('etaDisplay');
-const doneOverlay  = document.getElementById('doneOverlay');
-const doneSub      = document.getElementById('doneSub');
-const header       = document.getElementById('header');
+const exportBtn     = document.getElementById('exportBtn');
+const statusBox     = document.getElementById('statusBox');
+const projectCount  = document.getElementById('projectCount');
+const progressWrap  = document.getElementById('progressWrap');
+const progressBar   = document.getElementById('progressBar');
+const etaDisplay    = document.getElementById('etaDisplay');
+const doneOverlay   = document.getElementById('doneOverlay');
+const doneSub       = document.getElementById('doneSub');
+const header        = document.getElementById('header');
+const prevFile      = document.getElementById('prevFile');
+const prevFileTxt   = document.getElementById('prevFileTxt');
+const updateBtn     = document.getElementById('updateBtn');
 
 let port  = null;
 let tabId = null;
+
+let previousExportData = null; // full array from loaded file
+let knownConvsMap      = null; // { conversation_id: updated_at_iso }
 
 // ── Formatters ─────────────────────────────────────────────
 function formatEta(seconds) {
@@ -36,7 +42,6 @@ function setProgress(pct) {
 }
 
 function showDone(text) {
-  // Hide regular status, show the big done overlay
   statusBox.className = '';
   doneOverlay.classList.add('visible');
   header.classList.add('is-done');
@@ -44,12 +49,12 @@ function showDone(text) {
   setProgress(100);
   etaDisplay.textContent = '';
 
-  // Parse detail lines out of the done text
   const lines = text.split('\n').filter(Boolean);
-  doneSub.textContent = lines.slice(1).join('\n'); // everything after first line
+  doneSub.textContent = lines.slice(1).join('\n');
 
-  exportBtn.disabled   = false;
+  exportBtn.disabled    = false;
   exportBtn.textContent = '📥 Export Again';
+  if (knownConvsMap) updateBtn.disabled = false;
 }
 
 function resetToIdle() {
@@ -59,6 +64,7 @@ function resetToIdle() {
   statusBox.className = '';
   etaDisplay.textContent = '';
   exportBtn.textContent = '📥 Export to JSON';
+  if (knownConvsMap) updateBtn.disabled = false;
 }
 
 // ── On popup open: sync with content script state ──────────
@@ -118,6 +124,37 @@ function connectPort() {
         etaDisplay.textContent = formatEta(msg.eta);
         break;
 
+      case 'delta_done':
+        if (previousExportData && Array.isArray(msg.delta)) {
+          const merged  = [...previousExportData];
+          const idxById = new Map(merged.map((c, i) => [c.conversation_id, i]));
+          for (const conv of msg.delta) {
+            const idx = idxById.get(conv.conversation_id);
+            if (idx !== undefined) merged[idx] = conv;
+            else merged.push(conv);
+          }
+          merged.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+          const today    = new Date().toISOString().slice(0, 10);
+          const filename = `chatgpt_export_${today}.json`;
+          const blob = new Blob([JSON.stringify(merged, null, 2)], { type: 'application/json' });
+          const url  = URL.createObjectURL(blob);
+          const a    = document.createElement('a');
+          a.href     = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 5000);
+          previousExportData = merged; // update in-memory for next chained update
+          knownConvsMap = {};
+          for (const c of merged) {
+            if (c.conversation_id && c.updated_at) {
+              knownConvsMap[c.conversation_id] = c.updated_at;
+            }
+          }
+        }
+        break;
+
       case 'done':
         showDone(msg.text);
         port = null;
@@ -147,6 +184,51 @@ exportBtn.addEventListener('click', () => {
 
   connectPort();
   port.postMessage({ action: 'startExport' });
+});
+
+// ── Previous export file picker ───────────────────────────
+prevFile.addEventListener('change', async () => {
+  const file = prevFile.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    if (!Array.isArray(data)) throw new Error('not an array');
+    previousExportData = data;
+    knownConvsMap = {};
+    let matched = 0;
+    for (const conv of data) {
+      if (conv.conversation_id && conv.updated_at) {
+        knownConvsMap[conv.conversation_id] = conv.updated_at;
+        matched++;
+      }
+    }
+    const label = matched === data.length
+      ? `✅ ${data.length} convs loaded`
+      : `✅ ${data.length} convs (${matched} with timestamps)`;
+    prevFileTxt.textContent = label;
+    updateBtn.disabled = false;
+  } catch {
+    prevFileTxt.textContent = '❌ Invalid file — try again';
+    previousExportData = null;
+    knownConvsMap = null;
+    updateBtn.disabled = true;
+  }
+});
+
+// ── Incremental update button ─────────────────────────────
+updateBtn.addEventListener('click', () => {
+  if (!tabId || !knownConvsMap) return;
+
+  resetToIdle();
+  exportBtn.disabled    = true;
+  updateBtn.disabled    = true;
+  exportBtn.textContent = '⏳ Exporting…';
+  setStatus('Starting incremental update…', 'info');
+  setProgress(0);
+
+  connectPort();
+  port.postMessage({ action: 'startExport', knownConvs: knownConvsMap });
 });
 
 init();
