@@ -12,6 +12,10 @@ const header        = document.getElementById('header');
 const prevFile      = document.getElementById('prevFile');
 const prevFileTxt   = document.getElementById('prevFileTxt');
 const updateBtn     = document.getElementById('updateBtn');
+const resumeBar     = document.getElementById('resumeBar');
+const resumeText    = document.getElementById('resumeText');
+const resumeBtn     = document.getElementById('resumeBtn');
+const freshBtn      = document.getElementById('freshBtn');
 
 let port  = null;
 let tabId = null;
@@ -108,6 +112,12 @@ async function init() {
       setStatus('❌ ' + r.text, 'error');
     }
   }
+
+  if (status.checkpoint && !status.isExporting) {
+    const { count, total } = status.checkpoint;
+    resumeText.textContent = `⚡ Interrupted at ${count}${total ? '/' + total : ''} conversations — resume or discard?`;
+    resumeBar.classList.add('visible');
+  }
 }
 
 // ── Long-lived port for live progress ─────────────────────
@@ -172,16 +182,33 @@ function connectPort() {
   port.onDisconnect.addListener(() => { port = null; });
 }
 
+// ── Resume / Discard checkpoint ───────────────────────────
+resumeBtn.addEventListener('click', () => {
+  if (!tabId) return;
+  resumeBar.classList.remove('visible');
+  resetToIdle();
+  exportBtn.disabled    = true;
+  exportBtn.textContent = '⏳ Exporting…';
+  setStatus('Resuming from checkpoint…', 'info');
+  setProgress(0);
+  connectPort();
+  port.postMessage({ action: 'startExport', resumeFromCheckpoint: true });
+});
+
+freshBtn.addEventListener('click', () => {
+  resumeBar.classList.remove('visible');
+  if (tabId) chrome.tabs.sendMessage(tabId, { action: 'clearCheckpoint' });
+});
+
 // ── Export button ──────────────────────────────────────────
 exportBtn.addEventListener('click', () => {
   if (!tabId) return;
-
+  resumeBar.classList.remove('visible');
   resetToIdle();
   exportBtn.disabled    = true;
   exportBtn.textContent = '⏳ Exporting…';
   setStatus('Starting…', 'info');
   setProgress(0);
-
   connectPort();
   port.postMessage({ action: 'startExport' });
 });

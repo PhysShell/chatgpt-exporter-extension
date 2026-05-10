@@ -51,6 +51,26 @@
     return (t != null) ? new Date(Math.floor(t) * 1000).toISOString() : null;
   }
 
+  // ── Crash-recovery checkpoint ──────────────────────────────
+  const CHECKPOINT_KEY      = 'chatgpt_exporter_checkpoint';
+  const CHECKPOINT_INTERVAL = 50; // save every N successfully fetched conversations
+
+  async function saveCheckpoint(data) {
+    try { await chrome.storage.local.set({ [CHECKPOINT_KEY]: data }); }
+    catch (e) { console.warn('[ChatGPT Exporter] checkpoint save failed:', e); }
+  }
+
+  async function loadCheckpoint() {
+    try {
+      const r = await chrome.storage.local.get(CHECKPOINT_KEY);
+      return r[CHECKPOINT_KEY] || null;
+    } catch { return null; }
+  }
+
+  async function clearCheckpoint() {
+    try { await chrome.storage.local.remove(CHECKPOINT_KEY); } catch {}
+  }
+
   // ── Rate limiter state (adaptive, endpoint-aware) ──────────
   const RL = {
     listDelayMs:       RL_CONFIG.listDelayMs,
@@ -403,15 +423,22 @@
       return false;
     }
     if (msg.action === 'getStatus') {
-      sendResponse({
-        isExporting,
-        pct:         currentPct,
-        text:        currentText,
-        eta:         currentEta,
-        lastResult,
-        projectCount: Object.keys(projects).length,
+      loadCheckpoint().then(cp => {
+        sendResponse({
+          isExporting,
+          pct:          currentPct,
+          text:         currentText,
+          eta:          currentEta,
+          lastResult,
+          projectCount: Object.keys(projects).length,
+          checkpoint:   cp ? { count: cp.fetchedCount, total: cp.totalHint, startedAt: cp.startedAt } : null,
+        });
       });
-      return false;
+      return true; // async response
+    }
+    if (msg.action === 'clearCheckpoint') {
+      clearCheckpoint().then(() => sendResponse({}));
+      return true;
     }
   });
 
@@ -438,7 +465,7 @@
       lastResult  = null;
       isExporting = true;
       activeKnownConvs = msg.knownConvs ? new Map(Object.entries(msg.knownConvs)) : null;
-      runExport().catch(e => fail('Unexpected error: ' + e.message));
+      runExport(!!msg.resumeFromCheckpoint).catch(e => fail('Unexpected error: ' + e.message));
     });
 
     // Popup closed – export continues, port reference cleared
@@ -448,10 +475,44 @@
   // ══════════════════════════════════════════════════════════
   // MAIN EXPORT
   // ══════════════════════════════════════════════════════════
-  async function runExport() {
+  async function runExport(resumeMode = false) {
     progress('Getting auth token…', 2);
-    const token    = await getAccessToken();
-    const apiFetch = makeApiFetch(token);
+    const token = await getAccessToken();
+    let apiFetch = makeApiFetch(token); // `let` so auth restore can swap it
+
+    // Wait for the user to log back in instead of failing immediately.
+    // Returns true if auth was restored, false if we gave up (30 min timeout).
+    async function restoreAuth() {
+      progress('ChatGPT session expired — log back in at chatgpt.com, export resumes automatically…', currentPct, null);
+      for (let w = 0; w < 60; w++) {
+        await sleep(30_000);
+        const fresh = await getAccessToken();
+        if (fresh) { apiFetch = makeApiFetch(fresh); return true; }
+      }
+      return false;
+    }
+
+    // Load checkpoint (resume) or clear stale one (fresh start)
+    let checkpointFetchedIds   = new Set();
+    let checkpointConversations = [];
+    const checkpointStartedAt  = resumeMode ? null : new Date().toISOString();
+
+    if (resumeMode) {
+      const cp = await loadCheckpoint();
+      if (cp) {
+        checkpointFetchedIds    = new Set(cp.fetchedIds || []);
+        checkpointConversations = cp.conversations || [];
+        progress(
+          `Resuming: ${checkpointFetchedIds.size} conversations already saved — re-fetching conversation list…`,
+          5
+        );
+      } else {
+        resumeMode = false;
+        progress('No saved checkpoint found — starting fresh…', 2);
+      }
+    } else {
+      await clearCheckpoint();
+    }
 
     // 1. Discover projects
     progress('Detecting projects…', 5);
@@ -471,8 +532,8 @@
           { kind: 'list' }
         );
         if (data === AUTH_EXHAUSTED) {
-          fail('ChatGPT session expired. Refresh/reopen chatgpt.com, sign in again if needed, then restart export.');
-          return;
+          if (!await restoreAuth()) { fail('Session could not be restored after 30 min. Restart the export.'); return; }
+          continue;
         }
         if (!data || data === RL_EXHAUSTED) break;
         const items = Array.isArray(data) ? data : (data.items || data.conversations || []);
@@ -500,8 +561,8 @@
       const data = await apiFetch(url, { kind: 'list' });
 
       if (data === AUTH_EXHAUSTED) {
-        fail('ChatGPT session expired. Refresh/reopen chatgpt.com, sign in again if needed, then restart export.');
-        return;
+        if (!await restoreAuth()) { fail('Session could not be restored after 30 min. Restart the export.'); return; }
+        continue;
       }
       if (!data || data === RL_EXHAUSTED) break;
 
@@ -553,7 +614,9 @@
     }
 
     // 5. Fetch details + flatten to JSON
-    const conversations = [];
+    // Seed from checkpoint so a crash mid-run loses at most CHECKPOINT_INTERVAL fetches.
+    const fetchedIds    = checkpointFetchedIds;        // Set<id> of already-fetched convs
+    const conversations = checkpointConversations;     // array, pre-populated on resume
     const deferred      = [];  // rate-limit-exhausted → sweep later
     const missing       = [];  // genuine nulls (404 etc)
     const detailStart   = Date.now();
@@ -562,6 +625,7 @@
     let   skippedCount  = 0;
 
     function failWithPartial(reason) {
+      clearCheckpoint();
       if (conversations.length) {
         const tag      = isIncremental ? 'delta_partial' : 'partial';
         const filename = `chatgpt_export_${tag}_${today}_${conversations.length}_of_${total}.json`;
@@ -576,6 +640,14 @@
     for (let i = 0; i < allMeta.length; i++) {
       const conv = allMeta[i];
       const pct  = 35 + Math.round((i + 1) / total * 60);
+
+      // Resume: skip conversations already saved in a previous (crashed) run
+      if (fetchedIds.has(conv.id)) {
+        if (fetchedIds.size % 100 === 0 || i === allMeta.length - 1) {
+          progress(`Resuming: skipping already-saved ${fetchedIds.size}/${total}…`, pct);
+        }
+        continue;
+      }
 
       // Incremental: skip conversations that haven't changed since previous export
       if (activeKnownConvs) {
@@ -604,14 +676,24 @@
 
       const data = await apiFetch(`${BASE}/conversation/${conv.id}`, { kind: 'detail' });
       if (data === AUTH_EXHAUSTED) {
-        failWithPartial('ChatGPT session expired. Refresh/reopen chatgpt.com, sign in again if needed, then restart export.');
-        return;
+        if (!await restoreAuth()) { failWithPartial('Session could not be restored after 30 min.'); return; }
+        i--; continue; // retry same conversation with fresh token
       } else if (data === RL_EXHAUSTED) {
         deferred.push(conv);
       } else if (!data) {
         missing.push(conv);
       } else {
         conversations.push(conversationToFlat(data, conv._project_name || null));
+        fetchedIds.add(conv.id);
+        if (fetchedIds.size % CHECKPOINT_INTERVAL === 0) {
+          await saveCheckpoint({
+            fetchedIds:   [...fetchedIds],
+            conversations,
+            fetchedCount: fetchedIds.size,
+            totalHint:    total,
+            startedAt:    checkpointStartedAt,
+          });
+        }
       }
       if ((i + 1) % RL_CONFIG.detailBatchSize === 0 && i + 1 < allMeta.length) {
         progress(
@@ -641,8 +723,8 @@
         progress(`Retry (${i + 1}/${deferred.length}): "${(conv.title || 'Untitled').slice(0, 40)}"`, pct);
         const data = await apiFetch(`${BASE}/conversation/${conv.id}`, { retries: RL.maxRetries + 1, kind: 'detail' });
         if (data === AUTH_EXHAUSTED) {
-          failWithPartial('ChatGPT session expired. Refresh/reopen chatgpt.com, sign in again if needed, then restart export.');
-          return;
+          if (!await restoreAuth()) { failWithPartial('Session could not be restored after 30 min.'); return; }
+          i--; continue;
         } else if (data && data !== RL_EXHAUSTED) {
           conversations.push(conversationToFlat(data, conv._project_name || null));
         } else {
@@ -659,6 +741,7 @@
     }
 
     // 6. Build JSON & trigger download
+    await clearCheckpoint();
     progress('Creating JSON…', 98);
 
     const missSuffix = missing.length
