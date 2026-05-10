@@ -13,9 +13,9 @@
     listDelayMs: 1200,
     detailDelayMs: 4000,
     otherDelayMs: 1200,
-    minListDelayMs: 1000,
-    minDetailDelayMs: 3500,
-    minOtherDelayMs: 1000,
+    minListDelayMs: 200,         // probe floor — algorithm finds the real limit
+    minDetailDelayMs: 500,       // was 3500 (way too conservative)
+    minOtherDelayMs: 200,
     maxListDelayMs: 30000,
     maxDetailDelayMs: 120000,
     maxOtherDelayMs: 30000,
@@ -25,9 +25,10 @@
     networkInitialBackoffMs: 2500,
     maxBackoffMs: 15 * 60 * 1000,
     maxRetries: 4,
-    cooldownFactor: 1.5,
-    recoveryStepMs: 250,
-    recoveryThreshold: 40,
+    cooldownFactor: 2.0,         // harder backoff on 429 (was 1.5)
+    probeThreshold: 20,          // consecutive successes before starting a probe
+    probeCount: 5,               // requests at probe delay before adopting it
+    probeReduction: 0.80,        // multiply current delay by this per probe step
     detailStartCooldownMs: 30000,
     detailBatchSize: 75,
     detailBatchCooldownMs: 45000,
@@ -79,6 +80,10 @@
     maxRetries:        RL_CONFIG.maxRetries,
     globalPauseUntil:  0,
     successStreak:     { list: 0, detail: 0, other: 0 },
+    // Probe-and-confirm state (AIMD-style congestion control)
+    phase:             { list: 'stable', detail: 'stable', other: 'stable' },
+    probeDelay:        { list: 0,        detail: 0,        other: 0 },
+    probeRemaining:    { list: 0,        detail: 0,        other: 0 },
   };
 
   function delayKey(kind) {
@@ -105,6 +110,12 @@
     RL[delayKey(kind)] = Math.max(minDelayFor(kind), Math.min(maxDelayFor(kind), Math.ceil(value)));
   }
 
+  // Returns the delay actually used for the next gap sleep.
+  // During a probe phase this is the candidate (lower) delay, not the baseline.
+  function currentDelayFor(kind) {
+    return RL.phase[kind] === 'probing' ? RL.probeDelay[kind] : delayFor(kind);
+  }
+
   function requestKindFromUrl(url) {
     if (/\/conversation\/[^/?#]+/.test(url)) return 'detail';
     if (/\/conversations(?:[?#]|$)/.test(url) || /\/gizmos\/[^/]+\/conversations(?:[?#]|$)/.test(url)) return 'list';
@@ -129,15 +140,37 @@
   }
 
   function onRateLimited(kind) {
-    RL.successStreak[kind] = 0;
-    setDelayFor(kind, delayFor(kind) * RL_CONFIG.cooldownFactor);
+    // Back off from whatever delay was actually in use (probe or baseline).
+    const culprit = currentDelayFor(kind);
+    RL.phase[kind]          = 'stable';
+    RL.successStreak[kind]  = 0;
+    RL.probeRemaining[kind] = 0;
+    setDelayFor(kind, culprit * RL_CONFIG.cooldownFactor);
   }
 
   function onSuccess(kind) {
-    RL.successStreak[kind]++;
-    if (RL.successStreak[kind] >= RL_CONFIG.recoveryThreshold && delayFor(kind) > minDelayFor(kind)) {
-      setDelayFor(kind, delayFor(kind) - RL_CONFIG.recoveryStepMs);
-      RL.successStreak[kind] = 0;
+    if (RL.phase[kind] === 'probing') {
+      // Probe in progress — count down confirmations
+      RL.probeRemaining[kind]--;
+      if (RL.probeRemaining[kind] <= 0) {
+        // All probe requests succeeded → adopt the lower delay as new baseline
+        setDelayFor(kind, RL.probeDelay[kind]);
+        RL.phase[kind]         = 'stable';
+        RL.successStreak[kind] = 0;
+        console.log(`[ChatGPT Exporter] probe adopted: ${kind} delay → ${delayFor(kind)}ms`);
+      }
+    } else {
+      RL.successStreak[kind]++;
+      if (RL.successStreak[kind] >= RL_CONFIG.probeThreshold && delayFor(kind) > minDelayFor(kind)) {
+        const candidate = Math.max(minDelayFor(kind), Math.round(delayFor(kind) * RL_CONFIG.probeReduction));
+        if (candidate < delayFor(kind)) {
+          RL.probeDelay[kind]     = candidate;
+          RL.probeRemaining[kind] = RL_CONFIG.probeCount;
+          RL.phase[kind]          = 'probing';
+          console.log(`[ChatGPT Exporter] probing ${kind}: ${delayFor(kind)}ms → ${candidate}ms`);
+        }
+        RL.successStreak[kind] = 0;
+      }
     }
   }
 
@@ -256,7 +289,7 @@
     };
   }
 
-  function gapSleep(kind = 'other') { return sleep(delayFor(kind)); }
+  function gapSleep(kind = 'other') { return sleep(currentDelayFor(kind)); }
 
   // ── Progress (safe even when popup is closed) ──────────────
   function progress(text, pct, eta = null) {
@@ -669,7 +702,8 @@
       }
 
       progress(
-        `Downloading (${i + 1}/${total}): "${(conv.title || 'Untitled').slice(0, 40)}" [gap ${delayFor('detail')}ms]`,
+        `Downloading (${i + 1}/${total}): "${(conv.title || 'Untitled').slice(0, 40)}" ` +
+        `[${currentDelayFor('detail')}ms${RL.phase.detail === 'probing' ? '↓' : ''}]`,
         pct,
         eta
       );
